@@ -60,7 +60,8 @@ def test(data,
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
         
-        if trace:
+        fusion_safe = model.fusion_type not in ['early', 'mid', 'late']
+        if trace and fusion_safe:
             model = TracedModel(model, device, imgsz)
 
     # Half
@@ -90,7 +91,8 @@ def test(data,
     # Dataloader
     if not training:
         if device.type != 'cpu':
-            model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
+            if fusion_type not in ['mid', "late"]:
+                model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt, pad=0.5, rect=True,
                                        prefix=colorstr(f'{task}: '), fusion_type=fusion_type)[0]

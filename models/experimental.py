@@ -6,6 +6,8 @@ import cv2
 import os
 from utils.general import xywh2xyxy, xyxy2xywh
 from utils.plots import plot_one_box
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 
 from models.common import Conv, DWConv
 from utils.google_utils import attempt_download
@@ -411,44 +413,76 @@ class FusionLayer(nn.Module):
     def save_fused_tensor(x_fused, targets=None, idx=None):
         """
         Saves a fused tensor as a .jpg image with optional bounding boxes.
+        For mid-fusion features, applies random visualization strategy.
 
         Args:
-            x_fused (Tensor): (C, H, W)
-            targets (Tensor): (num_boxes, 6) -> (image_idx, class, x_center, y_center, width, height) normalized
+            x_fused (Tensor or ndarray): (C, H, W)
+            targets (Tensor or ndarray): (num_boxes, 6) in normalized xywh format
             idx (int): Optional index for filename uniqueness
         """
-        # Detach and move to CPU if needed
         if isinstance(x_fused, torch.Tensor):
             x_fused = x_fused.detach().cpu().numpy()
-
-        # Convert from (C, H, W) to (H, W, C)
         assert x_fused.ndim == 3, "Expected 3D tensor (C, H, W)"
-        img = np.transpose(x_fused, (1, 2, 0))
-        if img.max() <= 1.0:
-            img = (img * 255).astype(np.uint8)
-        else:
-            img = np.clip(img, 0, 255).astype(np.uint8)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        C, H, W = x_fused.shape
 
-        h, w = img.shape[:2]
-
-        # Draw targets
-        if targets is not None and len(targets):
-            if isinstance(targets, torch.Tensor):
-                targets = targets.cpu().numpy()
-            boxes = xywh2xyxy(targets[:, 2:6])
-            boxes[:, [0, 2]] *= w
-            boxes[:, [1, 3]] *= h
-
-            for i, box in enumerate(boxes):
-                cls = int(targets[i][1])
-                plot_one_box(box, img, label=str(cls), color=[0, 255, 0])
-
-        # Save image
         os.makedirs('fused_samples', exist_ok=True)
         if idx is None:
             idx = random.randint(0, 999999)
-        cv2.imwrite(os.path.join('fused_samples', f'fused_{idx}.jpg'), img)
+
+        if C == 3:
+            # Treat as RGB image
+            img = np.transpose(x_fused, (1, 2, 0))
+            if img.max() <= 1.0:
+                img = (img * 255).astype(np.uint8)
+            else:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+            # Draw targets
+            if targets is not None and len(targets):
+                if isinstance(targets, torch.Tensor):
+                    targets = targets.cpu().numpy()
+                boxes = xywh2xyxy(targets[:, 2:6])
+                boxes[:, [0, 2]] *= W
+                boxes[:, [1, 3]] *= H
+                for i, box in enumerate(boxes):
+                    cls = int(targets[i][1])
+                    plot_one_box(box, img, label=str(cls), color=[0, 255, 0])
+
+            cv2.imwrite(f'fused_samples/fused_{idx}.jpg', img)
+
+        else:
+            # Treat as mid-fusion feature map
+            choice = random.choice(["mean_heatmap", "pca_rgb", "channel_grid"])
+
+            if choice == "mean_heatmap":
+                fmap = x_fused.mean(axis=0)
+                fmap = (fmap - fmap.min()) / (fmap.max() - fmap.min() + 1e-8)
+                fmap = (fmap * 255).astype(np.uint8)
+                heatmap = cv2.applyColorMap(fmap, cv2.COLORMAP_JET)
+                cv2.imwrite(f"fused_samples/fused_heatmap_{idx}.jpg", heatmap)
+
+            elif choice == "pca_rgb":
+                flat = x_fused.reshape(C, -1).T  # shape (H*W, C)
+                pca = PCA(n_components=3)
+                rgb = pca.fit_transform(flat).reshape(H, W, 3)
+                rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
+                rgb = (rgb * 255).astype(np.uint8)
+                cv2.imwrite(f"fused_samples/fused_pca_rgb_{idx}.jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+            elif choice == "channel_grid":
+                ncols = min(8, C)
+                nrows = (C + ncols - 1) // ncols
+                fig, axs = plt.subplots(nrows, ncols, figsize=(ncols * 2, nrows * 2))
+                for i in range(C):
+                    ax = axs[i // ncols, i % ncols]
+                    ax.imshow(x_fused[i], cmap='viridis')
+                    ax.axis('off')
+                for j in range(C, nrows * ncols):
+                    axs[j // ncols, j % ncols].axis('off')
+                plt.tight_layout()
+                plt.savefig(f"fused_samples/fused_grid_{idx}.png")
+                plt.close()
 
 
 def attempt_load(weights, map_location=None):
