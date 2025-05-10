@@ -57,6 +57,12 @@ def test(data,
 
         # Load model
         model = attempt_load(weights, map_location=device)  # load FP32 model
+        model_ir = None
+        if opt.late_fusion and opt.ir_weights:
+            model_ir = attempt_load(opt.ir_weights, map_location=device)
+            if half:
+                model_ir.half()
+            model_ir.eval()
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
         
@@ -104,32 +110,38 @@ def test(data,
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        img = img.half() if half else img.float()
+        img /= 255.0
         targets = targets.to(device)
 
-        if enable_label_remap and targets.shape[0]:
-            your_to_coco_list = [2, 7, 0]
-            your_to_coco_tensor = torch.tensor(your_to_coco_list, device=targets.device)
-            targets[:, 1] = your_to_coco_tensor[targets[:, 1].long()]
-
-        nb, _, height, width = img.shape  # batch size, channels, height, width
+        if opt.late_fusion:
+            ir_imgs = []
+            for p in paths:
+                ir_path = p.replace('/rgb/', '/ir/')
+                ir_img = cv2.imread(ir_path)
+                ir_img = cv2.resize(ir_img, (imgsz, imgsz))
+                ir_img = torch.from_numpy(ir_img).permute(2, 0, 1).unsqueeze(0).to(device)
+                ir_imgs.append(ir_img)
+            ir_imgs = torch.cat(ir_imgs)
+            ir_imgs = ir_imgs.half() if half else ir_imgs.float()
+            ir_imgs /= 255.0
 
         with torch.no_grad():
-            # Run model
             t = time_synchronized()
-            out, train_out = model(img, augment=augment)  # inference and training outputs
-            t0 += time_synchronized() - t
-
-            # Compute loss
-            if compute_loss:
-                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
-
-            # Run NMS
-            targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
-            lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
-            t = time_synchronized()
-            out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+            if opt.late_fusion:
+                out_rgb, _ = model(img, augment=augment)
+                out_ir, _ = model_ir(ir_imgs, augment=augment)
+                out_combined = []
+                for pred_rgb, pred_ir in zip(out_rgb, out_ir):
+                    if pred_rgb is None:
+                        pred_rgb = torch.empty((0, 6), device=device)
+                    if pred_ir is None:
+                        pred_ir = torch.empty((0, 6), device=device)
+                    out_combined.append(torch.cat([pred_rgb, pred_ir], dim=0))
+                out = non_max_suppression(out_combined, conf_thres=conf_thres, iou_thres=iou_thres)
+            else:
+                out, train_out = model(img, augment=augment)
+                out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres)
             t1 += time_synchronized() - t
 
             if enable_label_remap:
@@ -325,6 +337,9 @@ if __name__ == '__main__':
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     parser.add_argument('--enable-label-remap', action='store_true', help='enable label remapping for using default coco labels with your dataset')
+    parser.add_argument('--late-fusion', action='store_true', help='enable late fusion of RGB and IR models')
+    parser.add_argument('--ir-weights', type=str, help='path to IR model weights for late fusion')
+
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
