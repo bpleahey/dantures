@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import yaml
 from tqdm import tqdm
+import cv2
 
 from models.experimental import attempt_load
 from utils.datasets import create_dataloader
@@ -117,7 +118,7 @@ def test(data,
         if opt.late_fusion:
             ir_imgs = []
             for p in paths:
-                ir_path = p.replace('/rgb/', '/ir/')
+                ir_path = p.replace('/rgb/', '/tir/')
                 ir_img = cv2.imread(ir_path)
                 ir_img = cv2.resize(ir_img, (imgsz, imgsz))
                 ir_img = torch.from_numpy(ir_img).permute(2, 0, 1).unsqueeze(0).to(device)
