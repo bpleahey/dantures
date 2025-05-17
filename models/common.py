@@ -59,7 +59,10 @@ class Concat(nn.Module):
         self.d = dimension
 
     def forward(self, x):
-        return torch.cat(x, self.d)
+        if isinstance(x, (list, tuple)):
+            return torch.cat(x, self.d)
+        else:
+            return x
 
 
 class Chuncat(nn.Module):

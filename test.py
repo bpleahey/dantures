@@ -12,7 +12,8 @@ from tqdm import tqdm
 from models.experimental import attempt_load
 from utils.datasets import create_dataloader
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
-    box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
+    box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr, weighted_average_boxes, \
+    weighted_nms_with_time
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
@@ -41,7 +42,10 @@ def test(data,
          trace=False,
          is_coco=False,
          v5_metric=False,
-         enable_label_remap=False):
+         enable_label_remap=False,
+         ir_weights=None,
+         late_fusion_type='NMS',
+         ):
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -57,24 +61,45 @@ def test(data,
 
         # Load model
         model = attempt_load(weights, map_location=device)  # load FP32 model
+        model_ir = None
+        if ir_weights:
+            model_ir = attempt_load(ir_weights, map_location=device)
         gs = max(int(model.stride.max()), 32)  # grid size (max stride)
         imgsz = check_img_size(imgsz, s=gs)  # check img_size
         
-        if trace:
+        if hasattr(model, 'fusion_type'):
+            tracing_safe = model.fusion_type not in ['early', 'mid', 'late']
+        else:
+            tracing_safe =   True
+        if trace and tracing_safe:
             model = TracedModel(model, device, imgsz)
+            if model_ir:
+                model_ir = TracedModel(model_ir, device, imgsz)
 
     # Half
     half = device.type != 'cpu' and half_precision  # half precision only supported on CUDA
     if half:
         model.half()
+        if model_ir:
+            model_ir.half()
 
     # Configure
     model.eval()
+
     if isinstance(data, str):
         is_coco = data.endswith('coco.yaml')
         with open(data) as f:
             data = yaml.load(f, Loader=yaml.SafeLoader)
     check_dataset(data)  # check
+
+    fusion_type = data.get('fusion_type', 'none')
+    is_fusion = fusion_type in ['early', 'mid', 'late']
+
+    if is_fusion:
+        for m in model.modules():
+            if hasattr(m, "eval_mode_fast"):
+                m.eval_mode_fast = True
+    
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
@@ -86,10 +111,38 @@ def test(data,
     # Dataloader
     if not training:
         if device.type != 'cpu':
-            model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
+            if is_fusion:
+                if fusion_type in ['early', 'mid']:
+                    dummy_rgb = torch.zeros(1, 3, imgsz, imgsz).to(device)
+                    dummy_ir = torch.zeros(1, 3, imgsz, imgsz).to(device)
+                    dummy_time = torch.zeros(1, dtype=torch.long).to(device)
+
+                    # Match model's precision
+                    dummy_rgb = dummy_rgb.type_as(next(model.parameters()))
+                    dummy_ir = dummy_ir.type_as(next(model.parameters()))
+
+                    model((dummy_rgb, dummy_ir, dummy_time))
+                elif fusion_type == 'late':
+                    dummy_rgb = torch.zeros(1, 3, imgsz, imgsz).to(device)
+                    dummy_ir = torch.zeros(1, 3, imgsz, imgsz).to(device)
+                    dummy_time = torch.zeros(1, dtype=torch.long).to(device)
+
+                    # Match model's precision
+                    dummy_rgb = dummy_rgb.type_as(next(model.parameters()))
+                    dummy_ir = dummy_ir.type_as(next(model.parameters()))
+
+                    model(dummy_rgb)
+                    model_ir(dummy_ir)
+                else:
+                    raise ValueError(f"Unknown fusion type: {fusion_type}")
+            else:
+                dummy = torch.zeros(1, 3, imgsz, imgsz).to(device)
+                # Match model's precision
+                dummy = dummy.type_as(next(model.parameters()))
+                model(dummy)
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt, pad=0.5, rect=True,
-                                       prefix=colorstr(f'{task}: '))[0]
+                                       prefix=colorstr(f'{task}: '), fusion_type=fusion_type)[0]
 
     if v5_metric:
         print("Testing with YOLOv5 AP metric...")
@@ -103,22 +156,59 @@ def test(data,
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
     for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
-        img = img.to(device, non_blocking=True)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        if is_fusion:
+            rgb_img, ir_img, time_idx = img
+            rgb_img = rgb_img.to(device, non_blocking=True)
+            ir_img = ir_img.to(device, non_blocking=True)
+            time_idx = time_idx.to(device, non_blocking=True) if isinstance(time_idx, torch.Tensor) else time_idx
+
+            rgb_img = rgb_img.half() if half else rgb_img.float()  # uint8 to fp16/32
+            ir_img = ir_img.half() if half else ir_img.float()  # uint8 to fp16/32
+            rgb_img /= 255.0  # 0 - 255 to 0.0 - 1.0
+            ir_img /= 255.0  # 0 - 255 to 0.0 - 1.0
+            img = (rgb_img, ir_img, time_idx)
+        else:
+            img = img.to(device, non_blocking=True)
+            img = img.half() if half else img.float()  # uint8 to fp16/32
+            img /= 255.0  # 0 - 255 to 0.0 - 1.0
+
+        
         targets = targets.to(device)
 
         if enable_label_remap and targets.shape[0]:
             your_to_coco_list = [2, 7, 0]
             your_to_coco_tensor = torch.tensor(your_to_coco_list, device=targets.device)
             targets[:, 1] = your_to_coco_tensor[targets[:, 1].long()]
+        
+        if is_fusion:
+            nb = img[0].shape[0]  # batch size
+            _, _, height, width = img[0].shape  # batch size, channels, height, width
+        else:
+             nb, _, height, width = img.shape  # batch size, channels, height, width
 
-        nb, _, height, width = img.shape  # batch size, channels, height, width
 
         with torch.no_grad():
+            out_ir = None
+            time_idx = None
             # Run model
             t = time_synchronized()
-            out, train_out = model(img, augment=augment)  # inference and training outputs
+
+            if isinstance(img, (tuple, list)):
+                if is_fusion:
+                    if fusion_type in ['early', 'mid']:
+                        (rgb_img, ir_img, time_idx) = img
+                        out, train_out = model((rgb_img, ir_img, time_idx), targets=targets)  # inference and training outputs
+                    elif fusion_type == 'late':
+                        (rgb_img, ir_img, time_idx) = img
+                        out, _ = model(rgb_img, augment=augment)  # RGB inference outputs (late fusion never needs training metrics)
+                        out_ir, _ = model_ir(ir_img, augment=augment)  # IR inference outputs (late fusion never needs training metrics)
+                    else:
+                        raise ValueError(f"Unknown fusion type: {fusion_type}")
+                else:
+                    raise ValueError("Model missing fusion_type attribute but input is a tuple.")
+            else:
+                out, train_out = model(img, augment=augment)
+            
             t0 += time_synchronized() - t
 
             # Compute loss
@@ -129,7 +219,61 @@ def test(data,
             targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
             lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
             t = time_synchronized()
-            out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+            if out_ir is not None:
+                if late_fusion_type == 'NMS':
+                    out = torch.cat((out, out_ir), dim=1) if out is not None else out_ir
+                    out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+                elif late_fusion_type == 'NMS+Weight':
+                # TODO: implement modified NMS that takes in time idxs and operates on final boxes rather than raw boxes
+                    out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+                    out_ir = non_max_suppression(out_ir, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+
+                    out_combined = []
+                    if time_idx is None:
+                        raise ValueError("time_idx is None, but late fusion type is NMS+Weight")
+                    
+                    for det_vis, det_ir, ti in zip(out, out_ir, time_idx):
+                        fused = weighted_nms_with_time(det_vis, det_ir, ti.item() if isinstance(ti, torch.Tensor) else ti, iou_thres=iou_thres)
+                        out_combined.append(fused)
+
+                    out = out_combined
+                elif late_fusion_type == 'AVG':
+                    out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+                    out_ir = non_max_suppression(out_ir, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+                    out_combined = []
+                    for det_vis, det_ir in zip(out, out_ir):
+                        fused = weighted_average_boxes(det_vis, det_ir, iou_threshold=iou_thres)
+                        out_combined.append(fused)
+                    
+                    out = out_combined
+                elif late_fusion_type == 'AVG+Weight':
+                    out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+                    out_ir = non_max_suppression(out_ir, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+                    out_combined = []
+                    if time_idx is None:
+                        raise ValueError("time_idx is None, but late fusion type is AVG+Weight")
+                    for det_vis, det_ir, ti in zip(out, out_ir, time_idx):
+                        # Example fixed weights
+                        if ti == 0:  # noon
+                            w_rgb, w_ir = 0.8, 0.2
+                        elif ti == 1:  # twilight
+                            w_rgb, w_ir = 0.5, 0.5
+                        elif ti == 2:  # night
+                            w_rgb, w_ir = 0.2, 0.8
+                        else:
+                            w_rgb, w_ir = 0.5, 0.5  # fallback
+                        
+                        fused = weighted_average_boxes(det_vis, det_ir, weight_rgb=w_rgb, weight_ir=w_ir, iou_threshold=iou_thres)
+                        out_combined.append(fused)
+                    
+                    out = out_combined
+                else:
+                    out = torch.cat((out, out_ir), dim=1) if out is not None else out_ir
+                    print("unknown late fusion type, using NMS")
+                    out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+            else: 
+                out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
+
             t1 += time_synchronized() - t
 
             if enable_label_remap:
@@ -155,7 +299,10 @@ def test(data,
 
             # Predictions
             predn = pred.clone()
-            scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])  # native-space pred
+            if is_fusion:
+                scale_coords(rgb_img[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])  # native-space pred
+            else:
+                scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])
 
             # Append to text file
             if save_txt:
@@ -175,7 +322,10 @@ def test(data,
                                  "scores": {"class_score": conf},
                                  "domain": "pixel"} for *xyxy, conf, cls in pred.tolist()]
                     boxes = {"predictions": {"box_data": box_data, "class_labels": names}}  # inference-space
-                    wandb_images.append(wandb_logger.wandb.Image(img[si], boxes=boxes, caption=path.name))
+                    if is_fusion:
+                        wandb_images.append(wandb_logger.wandb.Image(rgb_img[si], boxes=boxes, caption=path.name))
+                    else:
+                        wandb_images.append(wandb_logger.wandb.Image(img[si], boxes=boxes, caption=path.name))
             wandb_logger.log_training_progress(predn, path, names) if wandb_logger and wandb_logger.wandb_run else None
 
             # Append to pycocotools JSON dictionary
@@ -198,7 +348,10 @@ def test(data,
 
                 # target boxes
                 tbox = xywh2xyxy(labels[:, 1:5])
-                scale_coords(img[si].shape[1:], tbox, shapes[si][0], shapes[si][1])  # native-space labels
+                if is_fusion:
+                    scale_coords(rgb_img[si].shape[1:], tbox, shapes[si][0], shapes[si][1])  # native-space labels
+                else:
+                    scale_coords(img[si].shape[1:], tbox, shapes[si][0], shapes[si][1])
                 if plots:
                     confusion_matrix.process_batch(predn, torch.cat((labels[:, 0:1], tbox), 1))
 
@@ -228,10 +381,23 @@ def test(data,
 
         # Plot images
         if plots and batch_i < 3:
-            f = save_dir / f'test_batch{batch_i}_labels.jpg'  # labels
-            Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
-            f = save_dir / f'test_batch{batch_i}_pred.jpg'  # predictions
-            Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
+            # predictions:
+            if is_fusion:
+                f_rgb = save_dir / f'test_batch{batch_i}_rgb_labels.jpg'
+                f_ir = save_dir / f'test_batch{batch_i}_lwir_labels.jpg'
+                Thread(target=plot_images, args=(rgb_img, targets.cpu(), paths, f_rgb, names), daemon=True).start()
+                Thread(target=plot_images, args=(ir_img, targets.cpu(), paths, f_ir, names), daemon=True).start()
+
+                f_rgb = save_dir / f'test_batch{batch_i}_rgb_pred.jpg'
+                f_ir = save_dir / f'test_batch{batch_i}_lwir_pred.jpg'
+                Thread(target=plot_images, args=(rgb_img, output_to_target(out), paths, f_rgb, names), daemon=True).start()
+                Thread(target=plot_images, args=(ir_img, output_to_target(out), paths, f_ir, names), daemon=True).start()
+            else:
+                print("not reading as fusion in this thread")
+                f = save_dir / f'test_batch{batch_i}_labels.jpg'  # labels
+                Thread(target=plot_images, args=(img, targets.cpu(), paths, f, names), daemon=True).start()
+                f = save_dir / f'test_batch{batch_i}_pred.jpg'  # predictions
+                Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
@@ -325,6 +491,8 @@ if __name__ == '__main__':
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     parser.add_argument('--enable-label-remap', action='store_true', help='enable label remapping for using default coco labels with your dataset')
+    parser.add_argument('--ir-weights', type=str, help='path to IR model weights for late fusion')
+    parser.add_argument('--late-fusion-method', type=str, default='NMS', help='late fusion type (NMS, NMS+Weight, AVG, AVG+Weight)')
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
@@ -348,6 +516,8 @@ if __name__ == '__main__':
              trace=not opt.no_trace,
              v5_metric=opt.v5_metric,
              enable_label_remap=opt.enable_label_remap,
+             ir_weights=opt.ir_weights,
+             late_fusion_type=opt.late_fusion_method,
              )
 
     elif opt.task == 'speed':  # speed benchmarks

@@ -319,6 +319,7 @@ class IAuxDetect(nn.Module):
         super(IAuxDetect, self).__init__()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
+        print(f"anchors = {anchors}, nc = {self.nc}, na = {self.na}, no = {self.no}")
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
         self.grid = [torch.zeros(1)] * self.nl  # init grid
@@ -399,7 +400,6 @@ class IAuxDetect(nn.Module):
         return out
     
     def fuse(self):
-        print("IAuxDetect.fuse")
         # fuse ImplicitA and Convolution
         for i in range(len(self.m)):
             c1,c2,_,_ = self.m[i].weight.shape
@@ -516,6 +516,11 @@ class Model(nn.Module):
             self.yaml_file = Path(cfg).name
             with open(cfg) as f:
                 self.yaml = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
+        # self.fusion_mode = self.yaml.get('fusion_mode', "manual")  # "learned", "manual", or None
+        self.fusion_type = self.yaml.get('fusion_type', None)  # "early", "mid", "late", or None
+
+        # if self.fusion_type in ['early', 'mid']:
+        #     self.feature_fusion = FusionLayer(mode=self.fusion_mode)
 
         # Define model
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
@@ -525,15 +530,27 @@ class Model(nn.Module):
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
+        
+        if isinstance(self.yaml['anchors'], torch.Tensor):
+            self.yaml['anchors'] = self.yaml['anchors'].tolist()
+
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        self.model_ir = None
+        if self.fusion_type in ['late']:
+            #TODO: complete late fusion 
+            self.model_ir = parse_model(deepcopy(self.yaml), ch=[ch], ir=True)  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
+
         if isinstance(m, Detect):
             s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            if self.fusion_type in ['early', 'mid', 'late']:
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(2, ch, s, s), torch.zeros(2, ch, s, s), torch.zeros(2, dtype=torch.long))])
+            else:
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
@@ -541,7 +558,15 @@ class Model(nn.Module):
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IDetect):
             s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            if self.fusion_type in ['early', 'mid', 'late']:
+                out = self.forward(torch.zeros(1, ch, s, s), torch.zeros(1, ch, s, s), torch.zeros(1, dtype=torch.long))
+                for i, x_ in enumerate(out):
+                    print(f"out[{i}] = {None if x_ is None else x_.shape}")
+                if not isinstance(out, (list, tuple)):
+                    out = [out]              
+                m.stride = torch.tensor([s / x.shape[-2] for x in out])
+            else:
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
@@ -549,7 +574,10 @@ class Model(nn.Module):
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IAuxDetect):
             s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))[:4]])  # forward
+            if self.fusion_type in ['early', 'mid', 'late']:
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s), torch.zeros(1, ch, s, s), torch.zeros(1, dtype=torch.long))])
+            else:
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))[:4]])  # forward
             #print(m.stride)
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
@@ -558,7 +586,10 @@ class Model(nn.Module):
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IBin):
             s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            if self.fusion_type in ['early', 'mid', 'late']:
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s), torch.zeros(1, ch, s, s), torch.zeros(1, dtype=torch.long))])
+            else:
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
@@ -566,7 +597,10 @@ class Model(nn.Module):
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IKeypoint):
             s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            if self.fusion_type in ['early', 'mid', 'late']:
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s), torch.zeros(1, ch, s, s), torch.zeros(1, dtype=torch.long))])
+            else:
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
             self.stride = m.stride
@@ -578,8 +612,12 @@ class Model(nn.Module):
         self.info()
         logger.info('')
 
-    def forward(self, x, augment=False, profile=False):
+    def forward(self, *args, augment=False, profile=False, targets=None):
         if augment:
+            if len(args) != 1:
+                raise ValueError('Augmentation only supports single input')
+            else:
+                x = args[0]
             img_size = x.shape[-2:]  # height, width
             s = [1, 0.83, 0.67]  # scales
             f = [None, 3, None]  # flips (2-ud, 3-lr)
@@ -596,39 +634,179 @@ class Model(nn.Module):
                 y.append(yi)
             return torch.cat(y, 1), None  # augmented inference, train
         else:
-            return self.forward_once(x, profile)  # single-scale inference, train
+            # print(args)
+            if len(args) == 1:
+                # Single input (legacy)
+                x = args[0]
+            elif len(args) == 3:
+                rgb_imgs, lwir_imgs, time_idxs = args
+                # if self.fusion_type == 'early':
+                #     # EARLY: fuse in pixel space
+                #     x = self.feature_fusion(rgb_imgs, lwir_imgs, time_idxs, targets=targets)
 
-    def forward_once(self, x, profile=False):
-        y, dt = [], []  # outputs
+                # elif self.fusion_type == 'mid' or self.fusion_type == 'late':
+                #     rgb_feats = rgb_imgs
+                #     lwir_feats = lwir_imgs
+                #     x = (rgb_feats, lwir_feats, time_idxs)
+
+                if self.fusion_type in ['early', 'mid', 'late']:
+                    rgb_feats = rgb_imgs
+                    lwir_feats = lwir_imgs
+                    x = (rgb_feats, lwir_feats, time_idxs)
+                else:
+                    raise ValueError(f"Unsupported fusion type: {self.fusion_type}")
+            elif len(args) == 2 and all(isinstance(a, (list, tuple)) and len(a) == 2 for a in args):
+                (rgb_imgs, rgb_time), (lwir_imgs, lwir_time) = args
+                if not torch.equal(rgb_time, lwir_time):
+                    raise ValueError("Mismatched time_idx inputs")
+                time_idxs = rgb_time
+                x = (rgb_imgs, lwir_imgs, time_idxs)
+            elif len(args) == 3:
+                rgb_imgs, lwir_imgs, time_idxs = args
+                x = (rgb_imgs, lwir_imgs, time_idxs) 
+            else:
+                raise ValueError(f"Expected 1 or 3 inputs, got {len(args)}")
+            
+            if self.fusion_type == 'early':
+                # EARLY: fuse in pixel space
+                return self.forward_once(x, profile, targets=targets)  # forward
+            else:
+                return self.forward_once(x, profile)  # single-scale inference, train
+
+    def forward_once(self, x, profile=False, targets=None):
+        y, dt = [], []
+
         for m in self.model:
-            if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
-
-            if not hasattr(self, 'traced'):
-                self.traced=False
-
-            if self.traced:
-                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
+            # Handle input routing from previous layers
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            
+            # Optional: trace early exit
+            if getattr(self, 'traced', False):
+                if isinstance(m, (Detect, IDetect, IAuxDetect, IKeypoint)):
                     break
 
+            # Profiling
             if profile:
-                c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
-                o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
-                for _ in range(10):
-                    m(x.copy() if c else x)
+                is_head = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
+                o = thop.profile(m, inputs=(x if is_head else x,), verbose=False)[0] / 1E9 * 2 if thop else 0
+                for _ in range(10): m(x)
                 t = time_synchronized()
-                for _ in range(10):
-                    m(x.copy() if c else x)
+                for _ in range(10): m(x)
                 dt.append((time_synchronized() - t) * 100)
                 print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
-            x = m(x)  # run
-            
-            y.append(x if m.i in self.save else None)  # save output
+            # print(f"Layer ({m.__class__.__name__}): input shape = {x.shape if isinstance(x, torch.Tensor) else [e.shape for e in x]}")
+
+            # Run the module
+            if self.fusion_type and self.fusion_type == 'early':
+                if isinstance(m, FusionLayer):
+                    x = m(x, targets=targets)
+                else:
+                    
+                    x = m(x)
+            else:
+                # if isinstance(x, (list, tuple)): - debug
+                #     print(f"[Forwarding to {m.__class__.__name__}] len(x): {len(x)}, types: {[type(e) for e in x]}")
+
+                x = m(x)
+
+            # print(f"Layer ({m.__class__.__name__}): output shape = {x.shape if isinstance(x, torch.Tensor) else [e.shape for e in x]}")
+
+            # Save outputs if required
+            y.append(x if m.i in self.save else None)
 
         if profile:
             print('%.1fms total' % sum(dt))
+
         return x
+
+        # if isinstance(x, tuple) and self.fusion_type == 'mid':
+        #     # feature fusion
+        #     rgb_feats, lwir_feats, time_idxs = x
+
+        #     # Run backbone on each modality separately
+        #     y_rgb = []
+        #     y_lwir = []
+
+        #     for m in self.model:
+        #         if m.f != -1:
+        #             rgb_feats = y_rgb[m.f] if isinstance(m.f, int) else [rgb_feats if j == -1 else y_rgb[j] for j in m.f]
+        #             lwir_feats = y_lwir[m.f] if isinstance(m.f, int) else [lwir_feats if j == -1 else y_lwir[j] for j in m.f]
+
+        #         rgb_feats = m(rgb_feats)
+        #         lwir_feats = m(lwir_feats)
+
+        #         y_rgb = rgb_feats
+        #         y_lwir = lwir_feats
+
+        #     # Late fusion at bounding box level:
+        #     # Simple idea: average boxes and scores
+        #     fused_out = 0.5 * (rgb_feats[0] + lwir_feats[0])
+
+        #     return fused_out, None
+        
+        #     #TODO: test if this approach with profiling functions
+        #     # rgb_feats, lwir_feats, time_idxs = x
+
+        #     # y_rgb = []
+        #     # y_lwir = []
+        #     # dt = []
+
+        #     # for m in self.model:
+        #     #     if m.f != -1:
+        #     #         rgb_feats = y_rgb[m.f] if isinstance(m.f, int) else [rgb_feats if j == -1 else y_rgb[j] for j in m.f]
+        #     #         lwir_feats = y_lwir[m.f] if isinstance(m.f, int) else [lwir_feats if j == -1 else y_lwir[j] for j in m.f]
+
+        #     #     if profile:
+        #     #         c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
+        #     #         o = thop.profile(m, inputs=(rgb_feats.copy() if c else rgb_feats,), verbose=False)[0] / 1E9 * 2 if thop else 0
+        #     #         for _ in range(10):
+        #     #             m(rgb_feats.copy() if c else rgb_feats)
+        #     #         t = time_synchronized()
+        #     #         for _ in range(10):
+        #     #             m(rgb_feats.copy() if c else rgb_feats)
+        #     #         dt.append((time_synchronized() - t) * 100)
+        #     #         print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
+
+        #     #     rgb_feats = m(rgb_feats)
+        #     #     lwir_feats = m(lwir_feats)
+
+        #     #     y_rgb.append(rgb_feats if hasattr(m, 'i') and m.i in self.save else None)
+        #     #     y_lwir.append(lwir_feats if hasattr(m, 'i') and m.i in self.save else None)
+
+        #     # fused_out = 0.5 * (rgb_feats[0] + lwir_feats[0])
+            
+        # else:
+        #     for m in self.model:
+        #         if m.f != -1:  # if not from previous layer
+        #             x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+
+        #         if not hasattr(self, 'traced'):
+        #             self.traced=False
+
+        #         if self.traced:
+        #             if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
+        #                 break
+
+        #         if profile:
+        #             c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
+        #             o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
+        #             for _ in range(10):
+        #                 m(x.copy() if c else x)
+        #             t = time_synchronized()
+        #             for _ in range(10):
+        #                 m(x.copy() if c else x)
+        #             dt.append((time_synchronized() - t) * 100)
+        #             print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
+
+        #         x = m(x)  # run
+                
+        #         y.append(x if m.i in self.save else None)  # save output
+
+        #     if profile:
+        #         print('%.1fms total' % sum(dt))
+        #     return x
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3
@@ -739,78 +917,173 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
-    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
-    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
-        m = eval(m) if isinstance(m, str) else m  # eval strings
-        for j, a in enumerate(args):
-            try:
-                args[j] = eval(a) if isinstance(a, str) else a  # eval strings
-            except:
-                pass
+    context = {'nc': nc, 'anchors': anchors}
 
-        n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [nn.Conv2d, Conv, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC, 
-                 SPP, SPPF, SPPCSPC, GhostSPPCSPC, MixConv2d, Focus, Stem, GhostStem, CrossConv, 
-                 Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
-                 RepBottleneck, RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC,  
-                 Res, ResCSPA, ResCSPB, ResCSPC, 
-                 RepRes, RepResCSPA, RepResCSPB, RepResCSPC, 
-                 ResX, ResXCSPA, ResXCSPB, ResXCSPC, 
-                 RepResX, RepResXCSPA, RepResXCSPB, RepResXCSPC, 
-                 Ghost, GhostCSPA, GhostCSPB, GhostCSPC,
-                 SwinTransformerBlock, STCSPA, STCSPB, STCSPC,
-                 SwinTransformer2Block, ST2CSPA, ST2CSPB, ST2CSPC]:
-            c1, c2 = ch[f], args[0]
-            if c2 != no:  # if not output
-                c2 = make_divisible(c2 * gw, 8)
+    layers, save, c2 = [], [], ch[-1]
+    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):
+        m = eval(m) if isinstance(m, str) else m
+        args = resolve_args(safe_eval_args(args), context)
+        n = max(round(n * gd), 1) if n > 1 else n
 
-            args = [c1, c2, *args[1:]]
-            if m in [DownC, SPPCSPC, GhostSPPCSPC, 
-                     BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
-                     RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC, 
-                     ResCSPA, ResCSPB, ResCSPC, 
-                     RepResCSPA, RepResCSPB, RepResCSPC, 
-                     ResXCSPA, ResXCSPB, ResXCSPC, 
-                     RepResXCSPA, RepResXCSPB, RepResXCSPC,
-                     GhostCSPA, GhostCSPB, GhostCSPC,
-                     STCSPA, STCSPB, STCSPC,
-                     ST2CSPA, ST2CSPB, ST2CSPC]:
-                args.insert(2, n)  # number of repeats
-                n = 1
-        elif m is nn.BatchNorm2d:
-            args = [ch[f]]
-        elif m is Concat:
-            c2 = sum([ch[x] for x in f])
-        elif m is Chuncat:
-            c2 = sum([ch[x] for x in f])
-        elif m is Shortcut:
-            c2 = ch[f[0]]
-        elif m is Foldcut:
-            c2 = ch[f] // 2
-        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]:
-            args.append([ch[x] for x in f])
-            if isinstance(args[1], int):  # number of anchors
-                args[1] = [list(range(args[1] * 2))] * len(f)
-        elif m is ReOrg:
-            c2 = ch[f] * 4
-        elif m is Contract:
-            c2 = ch[f] * args[0] ** 2
-        elif m is Expand:
-            c2 = ch[f] // args[0] ** 2
+        # Infer channels
+        if isinstance(f, int):
+            ch_in = ch[f]
         else:
-            c2 = ch[f]
+            ch_in = sum([ch[x] for x in f]) if isinstance(f, list) else ch[f]
 
-        m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace('__main__.', '')  # module type
-        np = sum([x.numel() for x in m_.parameters()])  # number params
-        m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
-        logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        # Special modules
+        if m in [FusionLayer,SymmetricCrossAttention]:
+            if i == 0:
+                c2 = 3
+            else:
+                c2 = ch_in
+            m_ = m(*args) if isinstance(args, list) else m(**args)
+        elif m is DualLayer:
+            rgb_class, rgb_args = args[0]
+            lwir_class, lwir_args = args[1]
+
+            rgb_class = eval(rgb_class) if isinstance(rgb_class, str) else rgb_class
+            lwir_class = eval(lwir_class) if isinstance(lwir_class, str) else lwir_class
+
+            if isinstance(ch_in, int):
+                ch_in_rgb = ch_in_lwir = ch_in
+            else:
+                ch_in_rgb = ch_in[0]
+                ch_in_lwir = ch_in[1]
+
+            rgb_args, c2 = sanitize_args(rgb_class, rgb_args, ch_in_rgb, no, n, gw, gd)
+            lwir_args, _ = sanitize_args(lwir_class, lwir_args, ch_in_lwir, no, n, gw, gd)
+
+            rgb_layer = rgb_class(*rgb_args)
+            lwir_layer = lwir_class(*lwir_args)
+            m_ = DualLayer(rgb_layer, lwir_layer)
+        elif m is GMUFusionLayer:
+            if i == 0:
+                ch_in = 3
+            # Provide default args if not specified
+            if len(args) == 0:
+                args = [3, 64, 3, "learned", None]
+            elif len(args) == 2:
+                args += [3, "learned", None]
+            elif len(args) == 3:
+                args += [3, None]
+            elif len(args) == 4:
+                args.append(None)
+            m_ = GMUFusionLayer(*args)
+            c2 = args[1]  # hidden_dim
+        elif m is SymmetricCrossAttentionGMU:
+            # First layer in model (use input channels = 3)
+            if i == 0:
+                ch_in = 3
+            # Fill in default args if missing: (channels, time_dim, mode, downsample, ds_factor)
+            if len(args) == 0:
+                args = [ch_in, 3, "learned", True, 4]
+            elif len(args) == 1:
+                args += [3, "learned", True, 4]
+            elif len(args) == 2:
+                args += ["learned", True, 4]
+            elif len(args) == 3:
+                args += [True, 4]
+            elif len(args) == 4:
+                args.append(4)
+
+            m_ = SymmetricCrossAttentionGMU(*args)
+            c2 = args[0]  # channels (same in and out)
+        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]:
+            # Skip sanitize_args for detection heads
+            if len(args) < 3:
+                args.append([ch[x] for x in f] if isinstance(f, list) else [ch[f]])
+            m_ = m(*args)
+        else:
+            # args, c2 = sanitize_args(m, args, ch_in, no, n, gw, gd)
+            # m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)
+            args, c2 = sanitize_args(m, args, ch_in, no, n, gw, gd)
+            m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args)
+
+        # Logging
+        t = str(m)[8:-2].replace('__main__.', '')
+        np = sum([x.numel() for x in m_.parameters()])
+        m_.i, m_.f, m_.type, m_.np = i, f, t, np
+        logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))
+
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
         if i == 0:
             ch = []
-        ch.append(c2)
+        if c2 is not None:
+            ch.append(c2)
+        else:
+            raise ValueError(f"Invalid channel output for layer {i}: {c2}")
+
     return nn.Sequential(*layers), sorted(save)
+
+
+def resolve_args(args, context):
+    """Recursively resolve symbolic strings like 'nc' or 'anchors' in args using context dict."""
+    if isinstance(args, list):
+        return [resolve_args(a, context) for a in args]
+    elif isinstance(args, str) and args in context:
+        return context[args]
+    else:
+        return args
+
+def sanitize_args(m, args, ch_in, no=0, n=1, gw=1.0, gd=1.0):
+    args = args.copy()  # prevent modifying original list
+
+    # Handle convolutional and composite block types
+    if m in [nn.Conv2d, Conv, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC, 
+             SPP, SPPF, SPPCSPC, GhostSPPCSPC, MixConv2d, Focus, Stem, GhostStem, CrossConv, 
+             Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
+             RepBottleneck, RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC,  
+             Res, ResCSPA, ResCSPB, ResCSPC, 
+             RepRes, RepResCSPA, RepResCSPB, RepResCSPC, 
+             ResX, ResXCSPA, ResXCSPB, ResXCSPC, 
+             RepResX, RepResXCSPA, RepResXCSPB, RepResXCSPC, 
+             Ghost, GhostCSPA, GhostCSPB, GhostCSPC,
+             SwinTransformerBlock, STCSPA, STCSPB, STCSPC,
+             SwinTransformer2Block, ST2CSPA, ST2CSPB, ST2CSPC]:
+        
+        c2 = args[0]
+        if c2 != no:  # adjust for detection layer output
+            c2 = make_divisible(c2 * gw, 8)
+        args = [ch_in, c2, *args[1:]]
+
+        if m in [DownC, SPPCSPC, GhostSPPCSPC, 
+                 BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
+                 RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC, 
+                 ResCSPA, ResCSPB, ResCSPC, 
+                 RepResCSPA, RepResCSPB, RepResCSPC, 
+                 ResXCSPA, ResXCSPB, ResXCSPC, 
+                 RepResXCSPA, RepResXCSPB, RepResXCSPC,
+                 GhostCSPA, GhostCSPB, GhostCSPC,
+                 STCSPA, STCSPB, STCSPC,
+                 ST2CSPA, ST2CSPB, ST2CSPC]:
+            args.insert(2, n)  # insert repeat count after in/out channels
+            n = 1
+    elif m is nn.BatchNorm2d:
+        args = [ch_in]
+        c2 = ch_in
+    elif m is Contract:
+        c2 = ch_in * args[0] ** 2
+    elif m is Expand:
+        c2 = ch_in // args[0] ** 2
+    elif m is ReOrg:
+        c2 = ch_in * 4
+    else:
+        c2 = ch_in
+
+    return args, c2
+
+def safe_eval_args(arg_list):
+    if isinstance(arg_list, list):
+        return [safe_eval_args(a) for a in arg_list]
+    elif isinstance(arg_list, str):
+        try:
+            return eval(arg_list)
+        except Exception:
+            return arg_list
+    else:
+        return arg_list
 
 
 if __name__ == '__main__':
@@ -829,6 +1102,8 @@ if __name__ == '__main__':
     
     if opt.profile:
         img = torch.rand(1, 3, 640, 640).to(device)
+
+        #TODO: check if this works on paired images
         y = model(img, profile=True)
 
     # Profile

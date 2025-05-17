@@ -1,0 +1,7 @@
+train: ../data/train/rgb/
+val: ../data/val/rgb/
+
+nc: 3
+names: ["car", "truck", "person"]
+
+fusion_type: early

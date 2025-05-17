@@ -796,6 +796,73 @@ def non_max_suppression_kpt(prediction, conf_thres=0.25, iou_thres=0.45, classes
 
     return output
 
+def weighted_average_boxes(boxes1, boxes2, weight_rgb=0.5, weight_ir=0.5, iou_threshold=0.5):
+    if boxes1 is None or boxes2 is None or len(boxes1) == 0 or len(boxes2) == 0:
+        return torch.cat([boxes1, boxes2], dim=0)
+
+    iou = box_iou(boxes1[:, :4], boxes2[:, :4])  # IoU between modalities
+    matched = (iou > iou_threshold).nonzero(as_tuple=False)
+
+    keep1 = torch.ones(len(boxes1), dtype=torch.bool, device=boxes1.device)
+    keep2 = torch.ones(len(boxes2), dtype=torch.bool, device=boxes2.device)
+
+    fused_boxes = []
+
+    for m in matched:
+        i, j = m[0], m[1]
+        box1 = boxes1[i]
+        box2 = boxes2[j]
+
+        avg_box = box1[:4] * weight_rgb + box2[:4] * weight_ir
+        avg_conf = box1[4] * weight_rgb + box2[4] * weight_ir
+        avg_cls = box1[5] if box1[4] > box2[4] else box2[5]
+
+        fused_box = torch.cat([avg_box, avg_conf.unsqueeze(0), avg_cls.unsqueeze(0)])
+        fused_boxes.append(fused_box)
+
+        keep1[i] = False
+        keep2[j] = False
+
+    unmatched = torch.cat([boxes1[keep1], boxes2[keep2]], dim=0)
+    if fused_boxes:
+        fused_boxes = torch.stack(fused_boxes, dim=0)
+        combined = torch.cat([fused_boxes, unmatched], dim=0)
+    else:
+        combined = unmatched
+
+    return combined
+
+def weighted_nms_with_time(out_vis, out_ir, time_idx, iou_thres=0.5):
+    if out_vis is None or len(out_vis) == 0:
+        return out_ir
+    if out_ir is None or len(out_ir) == 0:
+        return out_vis
+
+    # Determine weights based on time of day
+    if time_idx == 0:
+        w_rgb, w_ir = 0.8, 0.2
+    elif time_idx == 1:
+        w_rgb, w_ir = 0.5, 0.5
+    elif time_idx == 2:
+        w_rgb, w_ir = 0.2, 0.8
+    else:
+        w_rgb, w_ir = 0.5, 0.5
+
+    # Add modality tags
+    out_vis_mod = out_vis.clone()
+    out_ir_mod = out_ir.clone()
+    out_vis_mod[:, 4] *= w_rgb  # adjust conf
+    out_ir_mod[:, 4] *= w_ir
+
+    combined = torch.cat([out_vis_mod, out_ir_mod], dim=0)
+
+    # Perform NMS on the combined adjusted boxes
+    boxes = combined[:, :4]
+    scores = combined[:, 4]
+
+    keep = torchvision.ops.nms(boxes, scores, iou_thres)
+
+    return combined[keep]
 
 def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_optimizer()
     # Strip optimizer from 'f' to finalize training, optionally save as 's'

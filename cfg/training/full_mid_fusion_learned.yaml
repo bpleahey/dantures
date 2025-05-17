@@ -1,0 +1,86 @@
+# parameters
+nc: 3
+depth_multiple: 1.0
+width_multiple: 1.0
+
+fusion_type: mid
+fusion_mode: learned
+
+anchors:
+  - [10, 13, 16, 30, 33, 23]
+  - [30, 61, 62, 45, 59, 119]
+  - [116, 90, 156, 198, 373, 326]
+
+# Backbone (full)
+backbone:
+  [
+    [-1, 1, DualLayer, [[Conv, [32, 3, 2]], [Conv, [32, 3, 2]]]],
+    [-1, 1, DualLayer, [[Conv, [64, 3, 2]], [Conv, [64, 3, 2]]]],
+    [-1, 1, DualLayer, [[Conv, [32, 1, 1]], [Conv, [32, 1, 1]]]],
+    [-2, 1, DualLayer, [[Conv, [32, 1, 1]], [Conv, [32, 1, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [32, 3, 1]], [Conv, [32, 3, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [32, 3, 1]], [Conv, [32, 3, 1]]]],
+    [[-1, -2, -3, -4], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+    [-1, 1, DualLayer, [[Conv, [64, 1, 1]], [Conv, [64, 1, 1]]]],
+    [-1, 1, DualLayer, [[MP, []], [MP, []]]],
+    [-1, 1, DualLayer, [[Conv, [128, 1, 1]], [Conv, [128, 1, 1]]]],
+    [-2, 1, DualLayer, [[Conv, [128, 1, 1]], [Conv, [128, 1, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [128, 3, 1]], [Conv, [128, 3, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [128, 3, 1]], [Conv, [128, 3, 1]]]],
+    [[-1, -2, -3, -4], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+    [-1, 1, DualLayer, [[Conv, [256, 1, 1]], [Conv, [256, 1, 1]]]],
+    [-1, 1, DualLayer, [[MP, []], [MP, []]]],
+    [-1, 1, DualLayer, [[Conv, [512, 1, 1]], [Conv, [512, 1, 1]]]],
+  ]
+
+# Head (full PANet & FPN, kept per modality, fused at final multi-scale outputs)
+head: [
+    [-1, 1, DualLayer, [[Conv, [256, 1, 1]], [Conv, [256, 1, 1]]]],
+    [-2, 1, DualLayer, [[Conv, [256, 1, 1]], [Conv, [256, 1, 1]]]],
+    [-1, 1, DualLayer, [[SP, [5]], [SP, [5]]]],
+    [-2, 1, DualLayer, [[SP, [9]], [SP, [9]]]],
+    [-3, 1, DualLayer, [[SP, [13]], [SP, [13]]]],
+    [[-1, -2, -3, -4], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+    [-1, 1, DualLayer, [[Conv, [256, 1, 1]], [Conv, [256, 1, 1]]]],
+    [[-1, -7], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+
+    # FPN/PANet layers per modality
+    [-1, 1, DualLayer, [[Conv, [128, 1, 1]], [Conv, [128, 1, 1]]]],
+    [
+      -1,
+      1,
+      DualLayer,
+      [
+        [nn.Upsample, [None, 2, "nearest"]],
+        [nn.Upsample, [None, 2, "nearest"]],
+      ],
+    ],
+    [14, 1, DualLayer, [[Conv, [128, 1, 1]], [Conv, [128, 1, 1]]]],
+
+    [[-1, -2], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+    [-1, 1, DualLayer, [[Conv, [64, 1, 1]], [Conv, [64, 1, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [64, 3, 1]], [Conv, [64, 3, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [64, 3, 1]], [Conv, [64, 3, 1]]]],
+    [[-1, -2, -3, -4], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+    [-1, 1, DualLayer, [[Conv, [128, 1, 1]], [Conv, [128, 1, 1]]]],
+
+    [-1, 1, DualLayer, [[Conv, [128, 3, 2]], [Conv, [128, 3, 2]]]],
+    [[-1, 9], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+    [-1, 1, DualLayer, [[Conv, [128, 1, 1]], [Conv, [128, 1, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [128, 3, 1]], [Conv, [128, 3, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [128, 3, 1]], [Conv, [128, 3, 1]]]],
+    [[-1, -2, -3, -4], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+    [-1, 1, DualLayer, [[Conv, [256, 1, 1]], [Conv, [256, 1, 1]]]],
+
+    [-1, 1, DualLayer, [[Conv, [256, 3, 2]], [Conv, [256, 3, 2]]]],
+    [[-1, 7], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+    [-1, 1, DualLayer, [[Conv, [256, 1, 1]], [Conv, [256, 1, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [256, 3, 1]], [Conv, [256, 3, 1]]]],
+    [-1, 1, DualLayer, [[Conv, [256, 3, 1]], [Conv, [256, 3, 1]]]],
+    [[-1, -2, -3, -4], 1, DualLayer, [[Concat, [1]], [Concat, [1]]]],
+    [-1, 1, DualLayer, [[Conv, [512, 1, 1]], [Conv, [512, 1, 1]]]],
+
+    # === FUSION before detection
+    [[15, 20, 27], 1, FusionLayer, ["learned"]],
+    [[-1], 1, IDetect, [nc, anchors]],
+  ]

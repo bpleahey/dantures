@@ -1,0 +1,15 @@
+val:
+  [
+    "../test/15m (50ft)/rgb/",
+    "../test/30m (100ft)/rgb/",
+    "../test/61m (200ft)/rgb/",
+    "../test/76m (250ft)/rgb/",
+    "../test/91m (300ft)/rgb/",
+    "../test/106m (350ft)/rgb/",
+    "../test/121m (400ft)/rgb/",
+  ]
+
+nc: 3
+fusion_type: mid
+
+names: ["car", "truck", "person"]

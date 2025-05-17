@@ -11,6 +11,7 @@ from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from threading import Thread
+import re
 
 import cv2
 import numpy as np
@@ -62,8 +63,34 @@ def exif_size(img):
     return s
 
 
+def find_lwir_path(rgb_path):
+    dirname, basename = os.path.split(rgb_path)
+    if 'rgb' in dirname.lower():
+        lwir_dir = dirname.lower().replace('rgb', 'tir')
+    else:
+        raise ValueError(f"Expected 'rgb' in path: {rgb_path}")
+    
+    # Try original name
+    lwir_path = os.path.join(lwir_dir, basename)
+    if os.path.exists(lwir_path):
+        return lwir_path
+
+    # Try with IR_ prefix
+    i = 0
+    while i < len(basename) and basename[i].isalpha():
+        i += 1
+    lwir_basename = basename[:i] + 'IR_' + basename[i:]
+    lwir_path_alt = os.path.join(lwir_dir, lwir_basename)
+    if os.path.exists(lwir_path_alt):
+        return lwir_path_alt
+
+    raise FileNotFoundError(f"No IR image found for {rgb_path}: tried {lwir_path} and {lwir_path_alt}")
+
+
+
+
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', fusion_type=None):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -75,19 +102,26 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       stride=int(stride),
                                       pad=pad,
                                       image_weights=image_weights,
-                                      prefix=prefix)
-
+                                      prefix=prefix, 
+                                      fusion_type=fusion_type)
+    
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
     sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
     loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
     # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
+    if fusion_type in ['early', 'mid', 'late']:
+        collate_fn = LoadImagesAndLabels.collate_fn_fusion
+    elif quad:
+        collate_fn = LoadImagesAndLabels.collate_fn4
+    else:
+        collate_fn = LoadImagesAndLabels.collate_fn
     dataloader = loader(dataset,
                         batch_size=batch_size,
                         num_workers=nw,
                         sampler=sampler,
                         pin_memory=True,
-                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+                        collate_fn=collate_fn)
     return dataloader, dataset
 
 
@@ -349,10 +383,41 @@ def img2label_paths(img_paths):
     sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
     return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
 
+def extract_time_of_day(filepath):
+    filepath = filepath.lower()
+    # Match subfolders like "1.1", "1.2", etc.
+
+    match = re.search(r'/(\d\.\d)/', filepath)
+    if match:
+        time_code = match.group(1)
+        time_map = {
+            "1.1": 2,  # pre_sunrise
+            "1.2": 1,  # post_sunrise
+            "1.3": 0,  # noon
+            "1.4": 1,  # pre_sunset
+            "1.5": 2,   # post_sunset
+            "2.1": 2,  # pre_sunrise
+            "2.2": 1,  # post_sunrise
+            "2.3": 0,  # noon
+            "2.4": 1,  # pre_sunset
+            "2.5": 2   # post_sunset
+        }
+        if time_code in time_map:
+            return time_map[time_code]
+
+    # fallback to original string search
+    if "noon" in filepath:
+        return 0
+    elif "post_sunrise" in filepath or "pre_sunset" in filepath:
+        return 1
+    elif "pre_sunrise" in filepath or "post_sunset" in filepath:
+        return 2
+
+    raise ValueError(f"Unknown time-of-day in path: {filepath}")
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='', fusion_type=None):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
@@ -361,7 +426,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
-        self.path = path        
+        self.path = path
+        self.fusion_type = fusion_type
         #self.albumentations = Albumentations() if augment else None
 
         try:
@@ -536,31 +602,68 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp['mosaic']
+        fusion_type = getattr(self, 'fusion_type', None)
+        use_fusion = fusion_type in ['early', 'mid', 'late']
+
         if mosaic:
-            # Load mosaic
-            if random.random() < 0.8:
-                img, labels = load_mosaic(self, index)
+            if use_fusion:
+                # Load Mosaic
+                if random.random() < 0.8:
+                    rgb_img, lwir_img, labels = load_mosaic_fusion(self, index)
+                else:
+                    rgb_img, lwir_img, labels = load_mosaic9_fusion(self, index)
             else:
-                img, labels = load_mosaic9(self, index)
+                # Load Mosaic
+                if random.random() < 0.8:
+                    rgb_img, labels = load_mosaic(self, index)
+                else:
+                    rgb_img, labels = load_mosaic9(self, index)
+                lwir_img = None
+            
             shapes = None
 
             # MixUp https://arxiv.org/pdf/1710.09412.pdf
             if random.random() < hyp['mixup']:
-                if random.random() < 0.8:
-                    img2, labels2 = load_mosaic(self, random.randint(0, len(self.labels) - 1))
-                else:
-                    img2, labels2 = load_mosaic9(self, random.randint(0, len(self.labels) - 1))
                 r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
-                img = (img * r + img2 * (1 - r)).astype(np.uint8)
+                if use_fusion:
+
+                    if random.random() < 0.8:
+                        img2, lwir_img2, labels2 = load_mosaic_fusion(self, random.randint(0, len(self.labels) - 1))
+                    else:
+                        img2, lwir_img2, labels2 = load_mosaic9_fusion(self, random.randint(0, len(self.labels) - 1))
+                    rgb_img = (rgb_img * r + img2 * (1 - r)).astype(np.uint8)
+                    lwir_img = (lwir_img * r + lwir_img2 * (1 - r)).astype(np.uint8)
+                else:
+                    if random.random() < 0.8:
+                        img2, labels2 = load_mosaic(self, random.randint(0, len(self.labels) - 1))
+                    else:
+                        img2, labels2 = load_mosaic9(self, random.randint(0, len(self.labels) - 1))
+                
+                    rgb_img = (rgb_img * r + img2 * (1 - r)).astype(np.uint8)
                 labels = np.concatenate((labels, labels2), 0)
 
         else:
             # Load image
-            img, (h0, w0), (h, w) = load_image(self, index)
+            rgb_img, (h0, w0), (h, w) = load_image(self, index)
+            
+            lwir_img = None
+            if use_fusion:
+                lwir_img, (ir_h0, ir_w0), (ir_h, ir_w) = load_ir_image(self, index)
+                
+                assert lwir_img is not None, f'Image Not Found associatd with {self.img_files[index]}'
+
+                if rgb_img.shape[0] != lwir_img.shape[0] or rgb_img.shape[1] != lwir_img.shape[1]:
+                    lwir_img = cv2.resize(lwir_img, (rgb_img.shape[1], rgb_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                
+                assert rgb_img.shape[0] == lwir_img.shape[0] and rgb_img.shape[1] == lwir_img.shape[1], \
+                    f"Image size mismatch: {rgb_img.shape} vs {lwir_img.shape}"
 
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
+            rgb_img, ratio, pad = letterbox(rgb_img, shape, auto=False, scaleup=self.augment)
+            if use_fusion:
+                lwir_img, _, _ = letterbox(lwir_img, shape, auto=False, scaleup=self.augment)
+
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
             labels = self.labels[index].copy()
@@ -570,7 +673,16 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         if self.augment:
             # Augment imagespace
             if not mosaic:
-                img, labels = random_perspective(img, labels,
+                if use_fusion:
+                    # rgb_img, lwir_img, labels = random_perspective_fused(rgb_img, lwir_img, labels,
+                    #                                                degrees=hyp['degrees'],
+                    #                                                translate=hyp['translate'],
+                    #                                                scale=hyp['scale'],
+                    #                                                shear=hyp['shear'],
+                    #                                                perspective=hyp['perspective'])
+                    pass
+                else:
+                    rgb_img, labels = random_perspective(rgb_img, labels,
                                                  degrees=hyp['degrees'],
                                                  translate=hyp['translate'],
                                                  scale=hyp['scale'],
@@ -580,8 +692,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             
             #img, labels = self.albumentations(img, labels)
 
-            # Augment colorspace
-            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+            # Augment colorspace for RGB only
+            augment_hsv(rgb_img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
 
             # Apply cutouts
             # if random.random() < 0.9:
@@ -597,24 +709,28 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     #print(len(sample_labels))
                     if len(sample_labels) == 0:
                         break
-                labels = pastein(img, labels, sample_labels, sample_images, sample_masks)
+                labels = pastein(rgb_img, labels, sample_labels, sample_images, sample_masks)
 
         nL = len(labels)  # number of labels
         if nL:
             labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
-            labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
-            labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
+            labels[:, [2, 4]] /= rgb_img.shape[0]  # normalized height 0-1
+            labels[:, [1, 3]] /= rgb_img.shape[1]  # normalized width 0-1
 
         if self.augment:
             # flip up-down
             if random.random() < hyp['flipud']:
-                img = np.flipud(img)
+                rgb_img = np.flipud(rgb_img)
+                if lwir_img is not None:
+                    lwir_img = np.flipud(lwir_img)
                 if nL:
                     labels[:, 2] = 1 - labels[:, 2]
 
             # flip left-right
             if random.random() < hyp['fliplr']:
-                img = np.fliplr(img)
+                rgb_img = np.fliplr(rgb_img)
+                if lwir_img is not None:
+                    lwir_img = np.fliplr(lwir_img)
                 if nL:
                     labels[:, 1] = 1 - labels[:, 1]
 
@@ -623,10 +739,29 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             labels_out[:, 1:] = torch.from_numpy(labels)
 
         # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
-        img = np.ascontiguousarray(img)
+        rgb_img = rgb_img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        rgb_img = np.ascontiguousarray(rgb_img)
+        if use_fusion:
+            # print(f"LWIR raw shape: {lwir_img.shape}")
+            lwir_img = lwir_img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB
+            lwir_img = np.ascontiguousarray(lwir_img)
 
-        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+        time_idx = extract_time_of_day(self.img_files[index])
+
+    #     # TODO: delete this eventually
+    #     if self.augment and random.random() < 0.05:
+    #         visualize_sample(
+    #             rgb_img=torch.from_numpy(rgb_img),
+    #             lwir_img=torch.from_numpy(lwir_img),
+    #             labels=labels_out[:, 1:],
+    #             save_path="debug/visuals",
+    #             prefix=f"idx_{index}_b{self.batch[index]}"
+    # )
+
+        if use_fusion:
+            return (torch.from_numpy(rgb_img), torch.from_numpy(lwir_img), time_idx), labels_out, self.img_files[index], shapes
+        else:
+            return torch.from_numpy(rgb_img), labels_out, self.img_files[index], shapes
 
     @staticmethod
     def collate_fn(batch):
@@ -634,6 +769,31 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
         return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+
+    @staticmethod
+    def collate_fn_fusion(batch):
+        # print("running fusion collate fn")
+        # print(len(batch))
+        imgs, labels, paths, shapes = zip(*batch)  # split batch into imgs, labels, paths, shapes
+        # print(len(imgs), len(labels), len(paths), len(shapes))
+        # imgs = [img for img in imgs if img is not None]
+        rgb_imgs, lwir_imgs, time_idxs = zip(*imgs)  # split imgs into rgb_img, lwir_img, time_idx
+        # print(len(rgb_imgs), len(lwir_imgs), len(time_idxs))
+        # print(time_idxs)
+
+        for i, t in enumerate(time_idxs):
+            if not isinstance(t, int):
+                print(f"Non-int time_idx at index {i}: {t} (type: {type(t)})")
+
+        rgb_imgs = torch.stack(rgb_imgs, 0)
+        lwir_imgs = torch.stack(lwir_imgs, 0)
+        time_idxs = torch.tensor(time_idxs, dtype=torch.long)
+        
+        for i, l in enumerate(labels):
+            l[:, 0] = i  # set image index within batch
+
+        labels_out = torch.cat(labels, 0)
+        return ((rgb_imgs, lwir_imgs, time_idxs), labels_out, paths, shapes)
 
     @staticmethod
     def collate_fn4(batch):
@@ -667,17 +827,29 @@ def load_image(self, index):
     # loads 1 image from dataset, returns img, original hw, resized hw
     img = self.imgs[index]
     if img is None:  # not cached
-        path = self.img_files[index]
-        img = cv2.imread(path)  # BGR
-        assert img is not None, 'Image Not Found ' + path
-        h0, w0 = img.shape[:2]  # orig hw
-        r = self.img_size / max(h0, w0)  # resize image to img_size
-        if r != 1:  # always resize down, only resize up if training with augmentation
-            interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
-            img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
-        return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
+        img = cv2.imread(self.img_files[index])  # BGR
+        assert img is not None, 'Image Not Found ' + self.img_files[index]
+        return load_image_complete(self, img)
     else:
         return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
+
+def load_ir_image(self, index):
+    #TODO: setup IR caching and adopt ir_img_files like above
+    lwir_path = find_lwir_path(self.img_files[index])
+    lwir_img = cv2.imread(lwir_path, cv2.IMREAD_GRAYSCALE)
+    assert lwir_img is not None, 'Image Not Found ' + lwir_path
+    lwir_img = np.expand_dims(lwir_img, axis=-1)
+    #TODO: should we support other, more semantically correct ways to align channels?
+    lwir_img = np.repeat(lwir_img, 3, axis=2)
+    return load_image_complete(self, lwir_img)
+
+def load_image_complete(self, img):
+    h0, w0 = img.shape[:2]  # orig hw
+    r = self.img_size / max(h0, w0)  # resize image to img_size
+    if r != 1:  # always resize down, only resize up if training with augmentation
+        interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
+        img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
+    return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
 
 
 def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
@@ -764,6 +936,75 @@ def load_mosaic(self, index):
     return img4, labels4
 
 
+def load_mosaic_fusion(self, index):
+    labels4, segments4 = [], []
+    s = self.img_size
+
+    yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]
+    indices = [index] + random.choices(self.indices, k=3)
+
+    for i, index in enumerate(indices):
+        rgb_img, _, (h, w) = load_image(self, index)
+        lwir_img, _, (h_ir, w_ir) = load_ir_image(self, index)
+
+        # Resize LWIR to match RGB shape
+        if rgb_img.shape[:2] != lwir_img.shape[:2]:
+            lwir_img = cv2.resize(lwir_img, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # Initialize mosaic base
+        if i == 0:
+            img4 = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
+            img4_lwir = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
+
+        # Calculate mosaic coordinates
+        if i == 0:  # top left
+            x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
+            x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+        elif i == 1:  # top right
+            x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+            x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), x2a - x1a, h
+        elif i == 2:  # bottom left
+            x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+            x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, y2a - y1a
+        elif i == 3:  # bottom right
+            x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+            x1b, y1b, x2b, y2b = 0, 0, x2a - x1a, y2a - y1a
+
+        img4[y1a:y2a, x1a:x2a] = rgb_img[y1b:y2b, x1b:x2b]
+        img4_lwir[y1a:y2a, x1a:x2a] = lwir_img[y1b:y2b, x1b:x2b]
+
+        padw, padh = x1a - x1b, y1a - y1b
+
+        # Load + transform labels
+        labels = self.labels[index].copy()
+        segments = self.segments[index].copy()
+        if labels.size:
+            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)
+            segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
+            labels4.append(labels)
+            segments4.extend(segments)
+
+    # Concat + clip
+    if labels4:
+        labels4 = np.concatenate(labels4, 0)
+        for x in (labels4[:, 1:], *segments4):
+            np.clip(x, 0, 2 * s, out=x)
+    else:
+        labels4 = np.zeros((0, 5), dtype=np.float32)
+
+    # Augment
+    # img4, labels4, segments4 = copy_paste(img4, labels4, segments4, probability=self.hyp['copy_paste'])
+    # img4, img4_lwir, labels4 = random_perspective_fused(img4, img4_lwir, labels4,
+    #                                            degrees=self.hyp['degrees'],
+    #                                            translate=self.hyp['translate'],
+    #                                            scale=self.hyp['scale'],
+    #                                            shear=self.hyp['shear'],
+    #                                            perspective=self.hyp['perspective'],
+    #                                            border=self.mosaic_border)  # border to remove
+
+
+    return img4, img4_lwir, labels4
+
 def load_mosaic9(self, index):
     # loads images in a 9-mosaic
 
@@ -839,6 +1080,92 @@ def load_mosaic9(self, index):
 
     return img9, labels9
 
+def load_mosaic9_fusion(self, index):
+    labels9, segments9 = [], []
+    s = self.img_size
+    indices = [index] + random.choices(self.indices, k=8)
+
+    img9 = None  # will be initialized in i == 0
+    for i, index in enumerate(indices):
+        # Load images
+        rgb_img, _, (h, w) = load_image(self, index)
+        lwir_img, _, (h_ir, w_ir) = load_ir_image(self, index)
+
+        # Resize LWIR to match RGB
+        if rgb_img.shape[:2] != lwir_img.shape[:2]:
+            lwir_img = cv2.resize(lwir_img, (rgb_img.shape[1], rgb_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+        assert rgb_img.shape[:2] == lwir_img.shape[:2]
+
+        if i == 0:
+            img9 = np.full((s * 3, s * 3, rgb_img.shape[2]), 114, dtype=np.uint8)
+            img9_lwir = np.full((s * 3, s * 3, lwir_img.shape[2]), 114, dtype=np.uint8)
+            h0, w0 = h, w
+            c = s, s, s + w, s + h
+        elif i == 1:
+            c = s, s - h, s + w, s
+        elif i == 2:
+            c = s + wp, s - h, s + wp + w, s
+        elif i == 3:
+            c = s + w0, s, s + w0 + w, s + h
+        elif i == 4:
+            c = s + w0, s + hp, s + w0 + w, s + hp + h
+        elif i == 5:
+            c = s + w0 - w, s + h0, s + w0, s + h0 + h
+        elif i == 6:
+            c = s + w0 - wp - w, s + h0, s + w0 - wp, s + h0 + h
+        elif i == 7:
+            c = s - w, s + h0 - h, s, s + h0
+        elif i == 8:
+            c = s - w, s + h0 - hp - h, s, s + h0 - hp
+
+        # Placement logic
+        padx, pady = c[:2]
+        x1a, y1a, x2a, y2a = [max(x, 0) for x in c]
+        x1b, y1b = max(0, -padx), max(0, -pady)
+        x2b = x1b + (x2a - x1a)
+        y2b = y1b + (y2a - y1a)
+
+        img9[y1a:y2a, x1a:x2a] = rgb_img[y1b:y2b, x1b:x2b]
+        img9_lwir[y1a:y2a, x1a:x2a] = lwir_img[y1b:y2b, x1b:x2b]
+
+        # Labels
+        labels, segments = self.labels[index].copy(), self.segments[index].copy()
+        if labels.size:
+            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padx, pady)
+            segments = [xyn2xy(x, w, h, padx, pady) for x in segments]
+        labels9.append(labels)
+        segments9.extend(segments)
+
+        hp, wp = h, w  # update previous height/width
+
+    # Final crop to 2x size
+    yc, xc = [int(random.uniform(0, s)) for _ in self.mosaic_border]
+    img9 = img9[yc:yc + 2 * s, xc:xc + 2 * s]
+    img9_lwir = img9_lwir[yc:yc + 2 * s, xc:xc + 2 * s]
+
+    # Offset labels
+    labels9 = np.concatenate(labels9, 0)
+    labels9[:, [1, 3]] -= xc
+    labels9[:, [2, 4]] -= yc
+    offset = np.array([xc, yc])
+    segments9 = [x - offset for x in segments9]
+
+    for x in (labels9[:, 1:], *segments9):
+        np.clip(x, 0, 2 * s, out=x)
+
+    # Augment
+    # img9, labels9, segments9 = remove_background(img9, labels9, segments9)
+    # img9, labels9, segments9 = copy_paste(img9, labels9, segments9, probability=self.hyp['copy_paste']) - don't use
+    # img9, img9_lwir, labels9 = random_perspective_fused(img9, img9_lwir, labels9, segments9,
+    #                                                 degrees=self.hyp['degrees'],
+    #                                                 translate=self.hyp['translate'],
+    #                                                 scale=self.hyp['scale'],
+    #                                                 shear=self.hyp['shear'],
+    #                                                 perspective=self.hyp['perspective'],
+    #                                                 border=self.mosaic_border)  # border to remove
+
+
+    return img9, img9_lwir, labels9
 
 def load_samples(self, index):
     # loads images in a 4-mosaic
@@ -1103,6 +1430,72 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
     return img, targets
 
 
+def random_perspective_fused(rgb_img, lwir_img, targets=(),  segments=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0,
+                       border=(0, 0)):
+    height = max(rgb_img.shape[0], lwir_img.shape[0]) + border[0] * 2
+    width = max(rgb_img.shape[1], lwir_img.shape[1]) + border[1] * 2
+
+    # Shared transformation matrix
+    C = np.eye(3)  # center
+    C[0, 2] = -width / 2
+    C[1, 2] = -height / 2
+
+    R = np.eye(3)  # rotation and scale
+    a = random.uniform(-degrees, degrees)
+    s = random.uniform(1 - scale, 1 + scale)
+    R[:2] = cv2.getRotationMatrix2D(center=(0, 0), angle=a, scale=s)
+
+    S = np.eye(3)
+    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+
+    T = np.eye(3)  # translation
+    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width
+    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height
+
+    M = T @ S @ R @ C # order of operations (right to left) is IMPORTANT
+
+    if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
+        if perspective:
+            rgb_img = cv2.warpPerspective(rgb_img, M, dsize=(width, height), borderValue=(114, 114, 114))
+            lwir_img = cv2.warpPerspective(lwir_img, M, dsize=(width, height), borderValue=(114, 114, 114))
+        else:  # affine
+            rgb_img = cv2.warpAffine(rgb_img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+            lwir_img = cv2.warpAffine(lwir_img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
+
+    n = len(targets)
+    if n:
+        use_segments = any(x.any() for x in segments)
+        new = np.zeros((n, 4))
+        if use_segments:  # warp segments
+            segments = resample_segments(segments)  # upsample
+            for i, segment in enumerate(segments):
+                xy = np.ones((len(segment), 3))
+                xy[:, :2] = segment
+                xy = xy @ M.T  # transform
+                xy = xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]  # perspective rescale or affine
+
+                # clip
+                new[i] = segment2box(xy, width, height)
+        else:
+            xy = np.ones((n * 4, 3))
+            xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)
+            xy = xy @ M.T  # transform
+            xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
+            # create new boxes
+            x = xy[:, [0, 2, 4, 6]]
+            y = xy[:, [1, 3, 5, 7]]
+            new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+            # clip
+            new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
+            new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
+        
+        # filter candidates
+        i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
+        targets = targets[i]
+
+    return rgb_img, lwir_img, targets
+
 def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
     # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
     w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
@@ -1288,6 +1681,32 @@ def extract_boxes(path='../coco/'):  # from utils.datasets import *; extract_box
                     b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
                     b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
                     assert cv2.imwrite(str(f), im[b[1]:b[3], b[0]:b[2]]), f'box failure in {f}'
+
+def visualize_sample(rgb_img, lwir_img, labels, save_path, prefix="sample"):
+    """Draws bounding boxes on RGB and LWIR images (assumes input is CHW tensor)."""
+    os.makedirs(save_path, exist_ok=True)
+
+    def draw_boxes(img, labels, name):
+        img_disp = img.transpose(1, 2, 0).copy()  # CHW to HWC
+        img_disp = img_disp[..., ::-1].copy()  # RGB to BGR for cv2
+        h, w = img_disp.shape[:2]
+
+        for l in labels:
+            cls, x, y, w_box, h_box = l
+            cx, cy = int(x * w), int(y * h)
+            bw, bh = int(w_box * w / 2), int(h_box * h / 2)
+            pt1 = (cx - bw, cy - bh)
+            pt2 = (cx + bw, cy + bh)
+            cv2.rectangle(img_disp, pt1, pt2, (0, 255, 0), 2)
+            cv2.putText(img_disp, f"{int(cls)}", (cx - bw, cy - bh - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        return img_disp
+
+    rgb_out = draw_boxes(rgb_img.numpy(), labels.numpy(), "rgb")
+    lwir_out = draw_boxes(lwir_img.numpy(), labels.numpy(), "lwir")
+
+    cv2.imwrite(os.path.join(save_path, f"{prefix}_rgb.jpg"), rgb_out)
+    cv2.imwrite(os.path.join(save_path, f"{prefix}_lwir.jpg"), lwir_out)
 
 
 def autosplit(path='../coco', weights=(0.9, 0.1, 0.0), annotated_only=False):

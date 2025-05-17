@@ -1,0 +1,14 @@
+# comment out subdirectories for ablation as necessary
+
+val:
+  [
+    "../test/test_ablation/15m (50ft)/rgb/",
+    "../test/test_ablation/30m (100ft)/rgb/",
+    "../test/test_ablation/45m (150ft)/rgb/",
+    "../test/test_ablation/61m (200ft)/rgb/",
+  ]
+
+nc: 3
+fusion_type: mid # set to early, mid, or late
+
+names: ["car", "truck", "person"]

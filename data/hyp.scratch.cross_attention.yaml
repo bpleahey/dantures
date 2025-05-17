@@ -1,0 +1,45 @@
+# YOLOv7 Hyperparameter File (Refined for Cross-Attention Fusion)
+
+# Optimizer & Learning Rate
+lr0: 0.01 # initial learning rate (SGD=1E-2, Adam=1E-3)
+lrf: 0.1 # final OneCycleLR learning rate (lr0 * lrf)
+momentum: 0.937 # SGD momentum/Adam beta1
+weight_decay: 0.0005 # optimizer weight decay
+
+# Warmup
+warmup_epochs: 3.0 # warmup epochs (fractions ok)
+warmup_momentum: 0.8 # warmup initial momentum
+warmup_bias_lr: 0.1 # warmup initial bias lr
+
+# Loss Gains
+box: 0.05 # box loss gain
+cls: 0.5 # ↑ stronger class loss (vs. default 0.3)
+cls_pw: 1.0 # cls BCELoss positive weight
+obj: 0.4 # ↓ weaker objectness loss (vs. default 0.7)
+obj_pw: 1.0 # obj BCELoss positive weight
+
+# Anchor & IoU Thresholds
+iou_t: 0.35 # ↑ looser iou target to boost recall
+anchor_t: 3.0 # ↓ tighter anchor-match threshold
+
+# Focal Loss
+fl_gamma: 0.0 # focal loss gamma (0 = disabled)
+
+# Augmentation
+hsv_h: 0.015 # hue augmentation
+hsv_s: 0.7 # saturation augmentation
+hsv_v: 0.4 # value augmentation
+degrees: 0.0 # image rotation
+translate: 0.2 # image translation
+scale: 0.5 # image scaling
+shear: 0.0 # image shear
+perspective: 0.0 # image perspective distortion
+flipud: 0.0 # vertical flip probability
+fliplr: 0.5 # horizontal flip probability
+mosaic: 1.0 # mosaic augmentation probability
+mixup: 0.0 # mixup disabled
+copy_paste: 0.0 # cutmix disabled
+paste_in: 0.0 # paste-in disabled
+
+# Detection Strategy
+loss_ota: 1 # use ComputeLossOTA (YOLOv7 default)
