@@ -536,9 +536,6 @@ class Model(nn.Module):
 
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.model_ir = None
-        if self.fusion_type in ['late']:
-            #TODO: complete late fusion 
-            self.model_ir = parse_model(deepcopy(self.yaml), ch=[ch], ir=True)  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
 
@@ -547,7 +544,7 @@ class Model(nn.Module):
 
         if isinstance(m, Detect):
             s = 256  # 2x min stride
-            if self.fusion_type in ['early', 'mid', 'late']:
+            if self.fusion_type in ['early', 'mid']:
                 m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(2, ch, s, s), torch.zeros(2, ch, s, s), torch.zeros(2, dtype=torch.long))])
             else:
                 m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
@@ -558,7 +555,7 @@ class Model(nn.Module):
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IDetect):
             s = 256  # 2x min stride
-            if self.fusion_type in ['early', 'mid', 'late']:
+            if self.fusion_type in ['early', 'mid']:
                 out = self.forward(torch.zeros(1, ch, s, s), torch.zeros(1, ch, s, s), torch.zeros(1, dtype=torch.long))
                 for i, x_ in enumerate(out):
                     print(f"out[{i}] = {None if x_ is None else x_.shape}")
@@ -574,7 +571,7 @@ class Model(nn.Module):
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IAuxDetect):
             s = 256  # 2x min stride
-            if self.fusion_type in ['early', 'mid', 'late']:
+            if self.fusion_type in ['early', 'mid']:
                 m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s), torch.zeros(1, ch, s, s), torch.zeros(1, dtype=torch.long))])
             else:
                 m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))[:4]])  # forward
@@ -586,7 +583,7 @@ class Model(nn.Module):
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IBin):
             s = 256  # 2x min stride
-            if self.fusion_type in ['early', 'mid', 'late']:
+            if self.fusion_type in ['early', 'mid']:
                 m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s), torch.zeros(1, ch, s, s), torch.zeros(1, dtype=torch.long))])
             else:
                 m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
@@ -597,7 +594,7 @@ class Model(nn.Module):
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IKeypoint):
             s = 256  # 2x min stride
-            if self.fusion_type in ['early', 'mid', 'late']:
+            if self.fusion_type in ['early', 'mid']:
                 m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s), torch.zeros(1, ch, s, s), torch.zeros(1, dtype=torch.long))])
             else:
                 m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
@@ -640,16 +637,8 @@ class Model(nn.Module):
                 x = args[0]
             elif len(args) == 3:
                 rgb_imgs, lwir_imgs, time_idxs = args
-                # if self.fusion_type == 'early':
-                #     # EARLY: fuse in pixel space
-                #     x = self.feature_fusion(rgb_imgs, lwir_imgs, time_idxs, targets=targets)
 
-                # elif self.fusion_type == 'mid' or self.fusion_type == 'late':
-                #     rgb_feats = rgb_imgs
-                #     lwir_feats = lwir_imgs
-                #     x = (rgb_feats, lwir_feats, time_idxs)
-
-                if self.fusion_type in ['early', 'mid', 'late']:
+                if self.fusion_type in ['early', 'mid']:
                     rgb_feats = rgb_imgs
                     lwir_feats = lwir_imgs
                     x = (rgb_feats, lwir_feats, time_idxs)

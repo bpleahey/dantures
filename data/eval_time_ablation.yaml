@@ -1,0 +1,14 @@
+# change x in dataset_x for subdirectories for ablation for 1-5
+
+val:
+  [
+    "../test/split_datasets_output/dataset_1/15m (50ft)/rgb/",
+    "../test/split_datasets_output/dataset_1/30m (100ft)/rgb/",
+    "../test/split_datasets_output/dataset_1/45m (150ft)/rgb/",
+    "../test/split_datasets_output/dataset_1/61m (200ft)/rgb/",
+  ]
+
+nc: 3
+fusion_type: early # set to early, mid, or late
+
+names: ["car", "truck", "person"]

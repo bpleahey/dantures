@@ -224,7 +224,6 @@ def test(data,
                     out = torch.cat((out, out_ir), dim=1) if out is not None else out_ir
                     out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
                 elif late_fusion_type == 'NMS+Weight':
-                # TODO: implement modified NMS that takes in time idxs and operates on final boxes rather than raw boxes
                     out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
                     out_ir = non_max_suppression(out_ir, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=True)
 

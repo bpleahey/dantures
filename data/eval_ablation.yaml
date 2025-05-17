@@ -9,6 +9,6 @@ val:
   ]
 
 nc: 3
-fusion_type: mid # set to early, mid, or late
+fusion_type: late # set to early, mid, or late
 
 names: ["car", "truck", "person"]

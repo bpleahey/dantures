@@ -68,8 +68,6 @@ class DualLayer(nn.Module):
         # No fusion: return the tuple for downstream use
         return (rgb_out, lwir_out, time_idx)
 
-
-#TODO: complete and test symmetriccrossattention block
 class SymmetricCrossAttention(nn.Module):
     def __init__(self, channels, time_dim=3, mode="manual", downsample=True, ds_factor=4):
         super().__init__()
@@ -652,17 +650,10 @@ class FusionLayer(nn.Module):
             alpha = self.predictor(time_embed).view(-1, 1, 1, 1)
         elif self.mode == "manual":
             alpha = self.alpha_table[time_idx].view(-1, 1, 1, 1).to(rgb.device)
-
-        # alpha = self.alpha_table.to(dtype=rgb.dtype, device=rgb.device)[time_idx].view(-1, 1, 1, 1)
-
-        #TODO: decide if i want to be saving images or not, change threshold
-        # if self.training:  # Only save during training
-        # # Save a few examples
         
         fused = alpha * rgb + (1 - alpha) * lwir
 
         if not self.training and random.random() < .01:  # only 1% of batches
-            # save_fused_tensor(alpha * rgb + (1 - alpha) * lwir)
             if targets is not None:
                 for i in range(rgb.shape[0]):  # for each image in batch
                     matching_targets = targets[targets[:, 0] == i]
