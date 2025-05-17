@@ -20,6 +20,13 @@ Training Runs (with model weights): https://drive.google.com/drive/folders/1Hike
 
 (more may be found at https://drive.google.com/drive/folders/1cHKFAZkAxPivKjn2tGZdk5yV4OmkACOg?usp=drive_link)
 
+Early Fusion Images:
+
+![fused_421673](https://github.com/user-attachments/assets/012a1ddd-8808-4c67-b8ab-67cce5405dad)
+![fused_441312](https://github.com/user-attachments/assets/26e1d8a7-63e0-45c6-b57e-8ae59582ede7)
+![fused_613786](https://github.com/user-attachments/assets/0d180fd1-ac8e-4bad-8711-1bfe0fdae621)
+![fused_661374](https://github.com/user-attachments/assets/5b1a9e9d-ac27-4fd1-82ee-dcfd432bd81e)
+
 Middle Fusion Heatmaps:
 
 ![fused_heatmap_405785](https://github.com/user-attachments/assets/a4fdfd4c-9329-4b82-a922-5922a4d1c18a)
