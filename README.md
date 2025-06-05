@@ -43,7 +43,7 @@ Similar to training, testing may be carried out through directly calling the tes
     # --late-fusion-method <method> # optionally for late fusion, specify which method you are using
 ```
 
-### Elevation Ablation Testing
+### Elevation Performance Comparison
 
 Our test dataset contains elevation information in addition to time-of-day information. Within `evaluate.ipynb`, we include code to split the dataset on each time of day. By modifying your data yaml, you may then assess how a model performs at each elevation.
 
