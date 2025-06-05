@@ -8,13 +8,48 @@ Training Runs (with model weights): https://drive.google.com/drive/folders/1Hike
 
 ## Training
 
+Training may be carried out through directly calling the train.py file, defining a Model instance and running pytorch code, or through the `train_val` notebook we have implemented. The structure for a training run in the command line may be found below:
+
+```
+!python train.py --img 640 \
+--batch 16 \ # batch size
+--epochs 50 \ # num epochs
+--data <your_data_paths>.yaml \ # data yaml. if no other directory is specified it will start from ./data/
+--cfg <model>.yaml \ # model config yaml. if not other directory is specified it will start from ./cfg/
+--weights <weights>.pt \ # load weights if desired
+--hyp hyp.scratch.custom.yaml \ # hyperparameter yaml. if no other directory is specified it will start from ./data/
+--name <your_name> # run name for logging purposes
+
+```
+
 ### Suggested Preprocessing
 
+Current preprocessing may be found in our jupyter notebooks. We are currently migrating this to helper files and will update this description accordingly.
 
 ## Testing
 
+Similar to training, testing may be carried out through directly calling the test.py file, using a PyTorch model you have trained yourself, or through the `evaluate` notebook we have implemented. The structure for a evaluating a model in the command line may be found below:
+
+```
+!python test.py --img 640 \ # image size
+    --batch 16 \ # batch size
+    --data <eval_x>.yaml \ # data yaml. if no other directory is specified it will start from ./data/
+    --device 0 \ # specify GPU (default is 0)
+    --weights <weights>.pt \  # load weights if desired
+    --conf 0.01 \ # bounding box confidence threshold
+    --iou 0.65 \ # iou threshold for considering overlapping prediction/ground truth boxes the same
+    --name <your_name> \ # run name for logging purposes
+    # --ir-weights <ir_best>.pt \ # if testing for late fusion, specify your ir model weights
+    # --late-fusion-method <method> # optionally for late fusion, specify which method you are using
+```
+
+### Elevation Ablation Testing
+
+Our test dataset contains elevation information in addition to time-of-day information. Within `evaluate.ipynb`, we include code to split the dataset on each time of day. By modifying your data yaml, you may then assess how a model performs at each elevation.
+
 ## Inference
 
+Inference does not yet support late or mid fusion but will be implemented shortly.
 
 ## Sample Fusion Outputs:
 
